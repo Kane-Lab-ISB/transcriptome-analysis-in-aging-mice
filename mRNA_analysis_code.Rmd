@@ -1,0 +1,864 @@
+---
+title: "Sex dimorphism and tissue specificity of gene expression changes in aging mice - Rmd"
+author: "Dantong Zhu"
+date: "2024-08-23"
+output:
+  html_document:
+    css: style.css
+    fig_caption: yes
+    highlight: tango
+    keep_md: yes
+    toc: yes
+    toc_float:
+      collapsed: no
+    toc_depth: 3
+    self_contained: yes
+    code_folding: hide
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      eval = TRUE)
+
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(ggpubr)
+library(pheatmap)
+library(tidyr)
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(caret)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(topGO)
+library(ComplexUpset)
+library(org.Mm.eg.db)
+library(gridExtra)
+library(viridis)
+library(gplots)
+library(UpSetR)
+library(ComplexHeatmap)
+library(enrichR)
+library(WGCNA)
+library(reshape2)
+library(igraph)
+library(limmaDE2)
+library(glmnet)
+library(biomaRt)
+```
+
+
+# 1. import metadata, transcript abundance data, and functions
+```{r}
+load("mRNA_metadata.RData") #meta_dat_ids, contains metadata for 56 samples 
+load("mRNA_count.RData") #mrna_dat_count, contains transcript count
+gene_list_intact = mrna_dat_count$gene #total gene list
+mrna_dat_count_excl = mrna_dat_count %>% dplyr::select(-gene) # exclude gene column
+source("mRNA_analysis_functions.R") ## Functions for subsequent analysis 
+
+get_treat_contrast = function(tissue1, age1, sex1, tissue2, age2, sex2){
+  contrast = paste0("group", tissue1, ".", age1, ".", sex1, " - ", "group", tissue2, ".", age2, ".", sex2)
+  contrast.matrix = makeContrasts(contrasts = contrast, levels = mm)
+  tmp = contrasts.fit(fit, contrast.matrix)
+  tmp = treat(tmp, lfc = log2(1.5))
+  tt = topTable(tmp, sort.by = "none", n = Inf, adjust.method = "BH")
+  tt["gene"] = gene2de
+  return(tt)
+} 
+
+get_volcano_plot = function(table){
+  table_sig = table %>%
+    filter(adj.P.Val < 0.05) %>%
+    arrange(adj.P.Val)
+  table_top10 = table_sig[1:10, ]
+  table_sig_pos = table_sig[table_sig$logFC > 0, ]
+  table_sig_neg = table_sig[table_sig$logFC < 0, ]
+  plot = ggplot(data = table,
+                aes(x = logFC,
+                    y = -log10(P.Value))) +
+    geom_point(size = 0.6, color = "grey95") +
+    geom_point(data = table_sig_pos,
+               aes(x = logFC,
+                   y = -log10(P.Value)),
+               color = "#39568CFF") +
+    geom_point(data = table_sig_neg,
+               aes(x = logFC,
+                   y = -log10(P.Value)),
+               color = "#DCE319FF") +
+    geom_text(data = table_top10,
+              aes(x = logFC,
+                  y = -log10(P.Value),
+                  label = table_top10$gene),
+              vjust = -0.8,
+              label.size = 2.5)
+  return(plot)
+}
+
+heatmap_plt = function(tissue, table){
+  de_table = table %>%
+    filter(adj.P.Val < 0.05) 
+  tissue_specific_samples = meta_dat_ids[meta_dat_ids$Tissue == tissue, ] %>%
+    filter(Group == "old") 
+  ## slice table and choose up to 25 genes by pvalue for heatmap
+  overlap_genes_ms = norm_expr %>%
+    as.data.frame() %>%
+    dplyr::select(unlist(tissue_specific_samples$`Novogene ID`))
+  overlap_genes_ms = overlap_genes_ms[rownames(overlap_genes_ms) %in% de_table$gene, ]
+  overlap_genes_ms_scale = apply(overlap_genes_ms, 1, scale) %>%
+    t()
+  colnames(overlap_genes_ms_scale) = tissue_specific_samples$`Novogene ID`
+  heatmap.2(overlap_genes_ms_scale, 
+            trace = c("none"), 
+            dendrogram = "column", 
+            col = viridis(20), labRow = FALSE, 
+            key.title = NA, key.xlab = NA, key.ylab = NA) 
+}
+
+enrich_analysis = function(gene_lst){
+  dbs = c("KEGG_2019_Mouse") 
+  enriched = enrichR::enrichr(gene_lst, dbs)
+  enr_kegg = enriched$KEGG_2019_Mouse %>%
+    visual_data_kegg() %>% 
+    dplyr::select(Term, count, Adjusted.P.value, ratio)
+  return(enr_kegg)
+}
+
+visual_data_kegg = function(table){
+  table_out = table %>%
+    arrange(Adjusted.P.value) %>%
+    mutate(count = sapply(1:length(table$Overlap), 
+                          function(x) {
+                            as.numeric(strsplit(table$Overlap, "/")[[x]][1])
+                          })) %>% 
+    mutate(gene_all = sapply(1:length(table$Overlap), 
+                             function(x) {
+                               as.numeric(strsplit(table$Overlap, "/")[[x]][2])
+                             })) %>%
+    mutate(ratio = count/gene_all*100) %>%
+    as.data.frame() 
+  table_out = table_out[1:10, ] %>% 
+    arrange(desc(Adjusted.P.value)) 
+  return(table_out)
+}
+
+agecomp_plot = function(table1, table2){
+  agecomp = merge(table1, table2, by = "gene")
+  de_table1 = table1 %>%
+    filter(adj.P.Val < 0.05)
+  de_table2 = table2 %>%
+    filter(adj.P.Val < 0.05)
+  age_common = intersect(de_table1$gene, de_table2$gene)
+  agecomp_sig_f = agecomp %>%
+    filter(adj.P.Val.x < 0.05)
+  agecomp_sig_m = agecomp %>%
+    filter(adj.P.Val.y < 0.05)
+  agecomp_com = agecomp[agecomp$gene %in% age_common, ]
+  plot = ggplot(data = agecomp,
+                aes(x = logFC.x,
+                    y = logFC.y)) +
+    geom_point(size = 0.6, color = "#E5E4E2") +
+    geom_vline(xintercept = 0, lty = 3) +
+    geom_hline(yintercept = 0, lty = 3) +
+    labs(x = "log2 Fold Change - Females",
+         y = "log2 Fold Change - Males") +
+    geom_point(data = agecomp_sig_f, color = "#39568CFF", size = 3.5) +
+    geom_point(data = agecomp_sig_m, color = "#DCE319FF", size = 3.5) +
+    geom_point(data = agecomp_com, color = "#20A387FF", size = 5, shape = 17)
+  return(plot)
+}
+```
+
+# 2. PCA plot (Additional file 1)
+```{r}
+## for figures
+ggplot2::theme_set(theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        plot.title = element_text(hjust = 0.5), text = element_text(size = 12), 
+        panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black")))
+## transpose dataset for pca and log transformation
+mrna_dat_t = mrna_dat_count_excl %>%
+             t() %>% 
+             as.data.frame() %>%
+             log2()
+## change count = 0 to 0 after log transformation              
+mrna_dat_t[mrna_dat_t == -Inf] = 0
+## eliminate columns with no variance
+mrna_dat_t_clean = mrna_dat_t[,-nearZeroVar(mrna_dat_t)]
+## separation by tissues
+mrna_pca_raw = prcomp(mrna_dat_t_clean, scale. = TRUE)
+meta_dat_ids = meta_dat_ids %>%
+               mutate(age_sex = paste0(Group, "_", Sex))
+#pdf(file = "Add_file1.pdf", width = 6, height = 4)
+ggplot(data = mrna_pca_raw$x,
+       aes(x = PC1,
+           y = PC2,
+           color = as.factor(meta_dat_ids$Tissue),
+           shape = as.factor(meta_dat_ids$age_sex))) +
+     geom_point(size = 4) +
+     labs(color = "Tissue",
+          shape = "Age*Sex",
+          x = paste0("PC1 (", format(round(summary(mrna_pca_raw)$importance[2, 1]*100, 1), nsmall = 1), "%)"),
+          y = paste0("PC2 (", format(round(summary(mrna_pca_raw)$importance[2, 2]*100, 1), nsmall = 1), "%)")) +
+    scale_color_manual(values = c("#39568CFF",
+                                  "#DCE319FF",
+                                  "#440154FF"), 
+                       labels=c("Gastrocnemius muscle",
+                                   "Liver",
+                                   "White adipose tissues"))
+```
+
+# 3. Differential Analysis by limma
+```{r}
+d0 = DGEList(mrna_dat_count_excl)
+d0 = calcNormFactors(d0)
+drop = which(apply(cpm(d0), 1, max) < 0.25) ## equals to count less than 10
+d = d0[-drop, ]
+gene2de = gene_list_intact[as.numeric(rownames(d))] 
+tissue = make.names(meta_dat_ids$Tissue)
+age = meta_dat_ids$Group
+sex = meta_dat_ids$Sex
+## voom test plot
+group = interaction(tissue, age, sex)
+mm = model.matrix(~ 0 + group) ## add zero to avoid the first level be renamed to intercept
+y = voom(d, mm, plot = F)
+fit = lmFit(y, mm)
+fit = eBayes(fit, trend = TRUE, robust = TRUE)
+## normalized gene expression
+norm_expr = y$E # no of gene 18364
+rownames(norm_expr) = gene2de
+```
+
+
+# 4. female vs male in old group in three tissues
+
+## 4a. volcano plot for three tissues (Figure 2ABC)
+```{r}
+gas_old_fvsm = get_treat_contrast("Gastroc.muscle", "old", "Female", 
+                               "Gastroc.muscle", "old", "Male")
+liver_old_fvsm = get_treat_contrast("Liver", "old", "Female", 
+                                 "Liver", "old", "Male")
+wat_old_fvsm = get_treat_contrast("WAT", "old", "Female", 
+                               "WAT", "old", "Male")
+
+fvsm_volcano = lapply(list(gas_old_fvsm,
+                          liver_old_fvsm,
+                          wat_old_fvsm),
+                      function(x) {
+                        plot = get_volcano_plot(x)
+                      return(plot)
+                      })
+#pdf(file = "Figure2ABC.pdf", width = 10, height = 5)
+ggarrange(plotlist = list(fvsm_volcano[[1]] + labs(x = "", y = "-log10(p-value)"),
+                          fvsm_volcano[[2]] + labs(x = "log2 Fold Change", y = "") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()),
+                          fvsm_volcano[[3]] + labs(x = "", y = "") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())),
+          ncol = 3, nrow = 1, align = "hv", common.legend = TRUE)
+```
+
+## 4b. heatmap for three tissues (Additional file 2)
+```{r}
+#pdf(file = "Add_file2A.pdf", width = 5, height = 3)
+gas_heatmap = heatmap_plt("Gastroc muscle", gas_old_fvsm)
+#pdf(file = "Add_file2B.pdf", width = 5, height = 3)
+liver_heatmap = heatmap_plt("Liver", liver_old_fvsm)
+#pdf(file = "Add_file2C.pdf", width = 5, height = 3)
+wat_heatmap = heatmap_plt("WAT", wat_old_fvsm)
+```
+
+## 4c. Upset plot for DEGs (Figure 2D)
+```{r}
+gas_old_fvsm_treatde = gas_old_fvsm %>% filter(adj.P.Val < 0.05)
+liver_old_fvsm_treatde = liver_old_fvsm %>% filter(adj.P.Val < 0.05)
+wat_old_fvsm_treatde = wat_old_fvsm %>% filter(adj.P.Val < 0.05)
+lt = list(`Muscle` = gas_old_fvsm_treatde$gene,
+          `Liver` = liver_old_fvsm_treatde$gene,
+          `WAT` = wat_old_fvsm_treatde$gene)
+m1 = make_comb_mat(lt)
+#pdf(file = "Figure2D.pdf", width = 8, height = 3)
+ComplexHeatmap::UpSet(m1,
+      comb_col = "#20A387FF",
+      set_order = c("Muscle", "Liver", "WAT"),
+      top_annotation = upset_top_annotation(m1, add_numbers = TRUE))
+```
+
+## 4d. tissue specific DEGs in the old group enrichment (Figure 2EFG)
+```{r}
+old_fvsm_lst = list(gas_old_fvsm_treatde$gene, liver_old_fvsm_treatde$gene, wat_old_fvsm_treatde$gene)
+three_overlap = Reduce(intersect, old_fvsm_lst)
+three_union = Reduce(union, old_fvsm_lst)
+unique_lst = lapply(1:3, function(x){
+  uni_set = setdiff(three_union, Reduce(union, old_fvsm_lst[-x]))
+  return(uni_set)
+})
+old_fvsm_name_lst = c("muscle", "liver", "wat")
+kegg_dat_lst = lapply(1:3, function(x) {
+  tbl = enrich_analysis(unique_lst[[x]]) %>%
+           mutate(tissue = rep(old_fvsm_name_lst[[x]], nrow(.)))
+  return(tbl)
+})
+kegg_dat_merge = Reduce(rbind, kegg_dat_lst)
+kegg_dat_merge = within(kegg_dat_merge, Term <- ave(as.character(kegg_dat_merge$Term), FUN = make.unique))
+kegg_dat_merge$Term = factor(kegg_dat_merge$Term, levels = kegg_dat_merge$Term)
+kegg_dat_merge$tissue = factor(kegg_dat_merge$tissue, levels = c("muscle", "liver", "wat"))
+#pdf(file = "Figure2EFG.pdf", width = 16, heigh = 4)
+ggplot(data = kegg_dat_merge,
+         aes(x = count,
+             y = Term)) +
+         geom_point(aes(color = -log10(Adjusted.P.value),
+             size = ratio)) +
+         facet_wrap(.~ tissue, 
+                            ncol = 3, nrow = 1,
+                            scales = "free") +
+         scale_color_viridis(direction = -1) + 
+         scale_y_discrete(position = "right") + 
+         theme(axis.text.y = element_text(face = "bold")) + 
+         labs(x = "Gene count",
+              y = "KEGG pathways",
+              color = "-log10(adjusted p-value)",
+              size = "Gene ratio")
+```
+
+## 4e. tissue specific DEGs up- and down-regulated enriched pathways (Additional file 3)
+```{r}
+## separate up- and down-regulated genes
+tissue_tbl_lst = list(gas_old_fvsm, liver_old_fvsm, wat_old_fvsm)
+unique_pos_lst = lapply(1:3, function(x){
+  tissue_tbl = tissue_tbl_lst[[x]]
+  unique_set = tissue_tbl[tissue_tbl$gene %in% unique_lst[[x]], ] %>%
+               filter(logFC > 0)
+  return(unique_set$gene)
+})
+unique_neg_lst = lapply(1:3, function(x){
+  tissue_tbl = tissue_tbl_lst[[x]]
+  unique_set = tissue_tbl[tissue_tbl$gene %in% unique_lst[[x]], ] %>%
+               filter(logFC < 0)
+  return(unique_set$gene)
+})
+pos_names = c("muscle_pos", "liver_pos", "wat_pos")
+neg_names = c("muscle_neg", "liver_neg", "wat_neg")
+pos_tbls = lapply(1:3, function(x){ # get pos enrich res for three tissues
+  tissue_tbl = enrich_analysis(unique_pos_lst[[x]]) %>%
+               mutate(type = rep(pos_names[[x]], nrow(.))) 
+})
+neg_tbls = lapply(1:3, function(x){ # get pos enrich res for three tissues
+  tissue_tbl = enrich_analysis(unique_neg_lst[[x]]) %>%
+               mutate(type = rep(neg_names[[x]], nrow(.))) 
+})
+
+kegg_dat_posneg = Reduce(rbind, list(pos_tbls[[1]] %>% filter(Adjusted.P.value < 0.05), 
+                                     pos_tbls[[2]] %>% filter(Adjusted.P.value < 0.05),
+                                     neg_tbls[[2]] %>% filter(Adjusted.P.value < 0.05), 
+                                     neg_tbls[[3]] %>% filter(Adjusted.P.value < 0.05)))
+kegg_dat_posneg = within(kegg_dat_posneg, Term <- ave(as.character(kegg_dat_posneg$Term), FUN = make.unique))
+kegg_dat_posneg$Term = factor(kegg_dat_posneg$Term, levels = kegg_dat_posneg$Term)
+#pdf(file = "Add_file3.pdf", height = 8, width = 12)
+ggplot(data = kegg_dat_posneg,
+         aes(x = count,
+             y = Term)) +
+         geom_point(aes(color = -log10(Adjusted.P.value),
+             size = ratio)) +
+         facet_wrap(.~ as.factor(type),
+                    scales = "free") +
+         scale_color_viridis(direction = -1) +
+         labs(x = "Gene count",
+              y = "KEGG pathways",
+              color = "-log10(adjusted p-value)",
+              size = "Gene ratio")
+```
+
+# 5. lasso regression to select important features (Additional file 4a)
+```{r}
+sex_chro_excl = getBM(attributes = c("mgi_symbol"), ## exclude sex chromosome related genes
+              filters = "chromosome_name",
+              values = 1:19,
+              mart = ensembl)
+excl_gene_lst = intersect(gene2de, make.names(sex_chro_excl$mgi_symbol))
+norm_expr = y$E
+rownames(norm_expr) = make.names(gene2de)
+norm_expr_ml = norm_expr[rownames(norm_expr) %in% excl_gene_lst, ]
+reg_dat = t(norm_expr_ml) %>% as.data.frame()
+old_group_ids = meta_dat_ids[meta_dat_ids$Group == "old", ] %>% 
+                mutate(sex_bin = ifelse(Sex == "Female", "yes", "no"))
+reg_dat_old = reg_dat[rownames(reg_dat) %in% old_group_ids$`Novogene ID`, ]
+set.seed(2023)
+seeds = vector(mode = "list", length = 21)
+for (i in 1:20) seeds = sample.int(1000, 20)
+betas_tbl = lapply(seeds, function(x) {
+  set.seed(x)
+  MySummary  = function(data, lev = NULL, model = NULL){
+      b1 = twoClassSummary(data, lev, model)
+      b1}
+  repeatedcv = trainControl(method = "repeatedcv", 
+                              number = 5,
+                              classProbs = TRUE,
+                              summaryFunction = MySummary)
+  elan_tuning = caret::train(reg_dat_old,
+                           as.factor(old_group_ids$Sex),
+                           method = "glmnet",
+                           family = "binomial",
+                           trControl = repeatedcv,
+                           metric = "ROC",
+                           tuneGrid = expand.grid(alpha = seq(0, 1, length = 20),
+                                               lambda = seq(0.001, 0.1, length = 20)))
+  glmnet_model = glmnet(x = as.matrix(reg_dat_old),
+                        y = old_group_ids$sex_bin,
+                        family = "binomial",
+                        alpha = elan_tuning$bestTune[[1]], 
+                        lambda = elan_tuning$bestTune[[2]])
+  betas = as.matrix(glmnet_model$beta) %>%
+        as.data.frame() %>%
+        t()
+  return(betas)
+})
+
+betas_tbl_update = Reduce(rbind, betas_tbl)
+coeff_sum = colSums(betas_tbl_update) %>% as.data.frame()
+colnames(coeff_sum) = c("sum_coeff") 
+coeff_sum_sort = coeff_sum %>%
+                 arrange(desc(abs(sum_coeff)))
+
+old_fvsm_features = rownames(coeff_sum_sort)[1:20] # top 20 features
+betas_tbl_features = betas_tbl_update %>% as.data.frame() %>%
+                     dplyr::select(old_fvsm_features)
+final_coeff = cbind(gene = names(colSums(betas_tbl_features)/20),
+                              coeff = colSums(betas_tbl_features)/20) %>%
+                        as.data.frame() %>% arrange(as.numeric(coeff))
+final_coeff$gene = factor(final_coeff$gene, levels = final_coeff$gene)
+
+#pdf(file = "Add_file4a.pdf", width = 4, height = 4.5)
+ggplot(data = final_coeff,
+       aes(x = as.numeric(coeff),
+           y = gene)) +
+      geom_bar(stat = "identity", fill = "#39568CFF")
+```
+
+# 6. sexes comp in both old and young groups
+
+## 6a. female and male specific DEGs in aging (Figure 3ABC)
+```{r}
+gas_f_agecomp = get_treat_contrast("Gastroc.muscle", "old", "Female", "Gastroc.muscle", "young", "Female") 
+gas_m_agecomp = get_treat_contrast("Gastroc.muscle", "old", "Male", "Gastroc.muscle", "young", "Male") 
+liver_f_agecomp = get_treat_contrast("Liver", "old", "Female", "Liver", "young", "Female") 
+liver_m_agecomp = get_treat_contrast("Liver", "old", "Male", "Liver", "young", "Male") 
+wat_f_agecomp = get_treat_contrast("WAT", "old", "Female", "WAT", "young", "Female")
+wat_m_agecomp = get_treat_contrast("WAT", "old", "Male", "WAT", "young", "Male") 
+
+#pdf(file = "Figure_3ABC.pdf", width = 5, height = 15)
+ggarrange(plotlist = list(agecomp_plot(gas_f_agecomp, gas_m_agecomp) + labs(x = "") + ylim(-8, 8) + xlim(-4, 4),
+                          agecomp_plot(liver_f_agecomp, liver_m_agecomp) + labs(y = "") + ylim(-8, 8) + xlim(-11, 11),
+                          agecomp_plot(wat_f_agecomp, wat_m_agecomp) + labs(x = "", y = "") + ylim(-8, 8) + xlim(-8, 8)), 
+          ncol = 1, nrow = 3, align = "hv", common.legend = TRUE)
+```
+
+## 6b. upset plot including 6 comparison pairs (Figure 3D)
+```{r}
+#pdf(file = "Figure3d.pdf", width = 10, height = 4)
+agecomp_de_lst = lapply(list(gas_f_agecomp, gas_m_agecomp,
+                             liver_f_agecomp, liver_m_agecomp,
+                             wat_f_agecomp, wat_m_agecomp), function(x){
+                              de_tbl = x %>% filter(adj.P.Val < 0.05)
+                               return(de_tbl$gene)
+                             })
+
+agecomp_de_tbl = lapply(list(gas_f_agecomp, gas_m_agecomp,
+                             liver_f_agecomp, liver_m_agecomp,
+                             wat_f_agecomp, wat_m_agecomp), function(x){
+                              de_tbl = x %>% filter(adj.P.Val < 0.05) %>% 
+                                arrange(adj.P.Val)
+                               return(de_tbl)
+                             })
+lt_2 = list(`muscle_f` = agecomp_de_lst[[1]],
+            `liver_f` = agecomp_de_lst[[3]],
+            `wat_f` = agecomp_de_lst[[5]],
+            `muscle_m` = agecomp_de_lst[[2]],
+            `liver_m` = agecomp_de_lst[[4]],
+            `wat_m` = agecomp_de_lst[[6]])
+
+m_2 = make_comb_mat(lt_2)
+ComplexHeatmap::UpSet(m_2,
+      comb_col = "#20A387FF",
+      set_order = c("wat_m", "wat_f", 
+                    "liver_m", "liver_f", 
+                    "muscle_m", "muscle_f"),
+      top_annotation = upset_top_annotation(m_2, add_numbers = TRUE))
+```
+
+## 6c. interesting degs in liver and enrichment (Figure 3E)
+```{r}
+liver_f_agecomp_de = liver_f_agecomp %>% filter(adj.P.Val < 0.05)
+liver_m_agecomp_de = liver_m_agecomp %>% filter(adj.P.Val < 0.05)
+liver_agecomp_over = intersect(liver_f_agecomp_de$gene, liver_m_agecomp_de$gene)
+liver_interting_deg = merge(liver_f_agecomp_de, liver_m_agecomp_de, by = "gene") %>%
+             filter(logFC.x * logFC.y < 0)
+
+liver_agecomp_over_kegg = enrich_analysis(liver_agecomp_over)
+liver_agecomp_over_kegg$Term = factor(liver_agecomp_over_kegg$Term, levels = liver_agecomp_over_kegg$Term)
+
+#pdf(file = "Figure3e.pdf", width = 8, height = 3)
+ggplot(data = liver_agecomp_over_kegg,
+         aes(x = count,
+             y = Term, 
+             color = -log10(Adjusted.P.value),
+             size = ratio)) +
+         geom_point() +
+         scale_color_viridis(direction = -1) +
+        scale_y_discrete(position = "right") + 
+         theme(axis.text.y = element_text(face = "bold")) + 
+         labs(x = "Gene count",
+              y = "KEGG Term",
+              color = "-log10(adjusted p-value)",
+              size = "Gene ratio")
+```
+
+## 6d. unique degs in f/m tissues (Additional file 5)
+```{r}
+agecomp_spe = lapply(1:6, function(x) {
+  uni_set = setdiff(agecomp_de_lst[[x]], Reduce(union, agecomp_de_lst[-x]))
+  return(uni_set)
+})
+agecomp_name_lst = c("muscle_f", "muscle_m",
+                     "liver_f", "liver_m",
+                     "wat_f", "wat_m")
+agecomp_spe_kegg = lapply(c(2:5), function(x) {
+  tbl = enrich_analysis(agecomp_spe[[x]]) %>%
+        mutate(type = rep(agecomp_name_lst[[x]], nrow(.)))
+  return(tbl)
+})
+
+kegg_data = Reduce(rbind, agecomp_spe_kegg) %>%
+            filter(Adjusted.P.value < 0.05)
+kegg_data = within(kegg_data, Term <- ave(as.character(kegg_data$Term), FUN = make.unique))
+kegg_data$Term= factor(kegg_data$Term, levels = kegg_data$Term)
+
+#pdf(file = "Add_file5.pdf", height = 8, width = 12)
+ggplot(data = kegg_data,
+         aes(x = count,
+             y = Term)) +
+         geom_point(aes(color = -log10(Adjusted.P.value),
+                    size = ratio)) + 
+         scale_color_viridis(direction = -1) +
+         labs(x = "Gene count",
+              y = "KEGG pathways",
+              color = "-log10(adjusted p-value)",
+              size = "Gene ratio") +
+         facet_wrap(. ~ as.factor(type),
+                    scales = "free")
+```
+
+## 7. genes predictive for age group in females and males (Add file 4bc)
+```{r}
+set.seed(2023)
+seeds = vector(mode = "list", length = 21)
+for (i in 1:20) seeds = sample.int(1000, 20)
+sex_agecomp_features = lapply(c("Female", "Male"), function(x) {
+  sex_ids = meta_dat_ids[meta_dat_ids$Sex == x, ] %>%
+            mutate(group_bin = ifelse(Group == "old", "yes", "no"))
+  reg_dat_sex = reg_dat[rownames(reg_dat) %in% sex_ids$`Novogene ID`, ]
+  betas_tbl = lapply(seeds, function(y) {
+    set.seed(y)
+    MySummary  = function(data, lev = NULL, model = NULL){
+        b1 = twoClassSummary(data, lev, model)
+        b1}
+    repeatedcv = trainControl(method = "repeatedcv", 
+                              number = 5,
+                              classProbs = TRUE,
+                              summaryFunction = MySummary)
+    elan_tuning = caret::train(reg_dat_sex,
+                           as.factor(sex_ids$Group),
+                           method = "glmnet",
+                           family = "binomial",
+                           metric = "ROC",
+                           trControl = repeatedcv,
+                           tuneGrid = expand.grid(alpha = seq(0, 1, length = 20),
+                                               lambda = seq(0.001, 0.1, length = 20)))
+    glmnet_model = glmnet(x = as.matrix(reg_dat_sex),
+                        y = sex_ids$group_bin,
+                        family = "binomial",
+                        alpha = elan_tuning$bestTune[[1]], 
+                        lambda = elan_tuning$bestTune[[2]])
+    betas = as.matrix(glmnet_model$beta) %>%
+        as.data.frame() %>%
+        t()
+    return(betas)
+  })
+  betas_tbl_update = Reduce(rbind, betas_tbl)
+  return(betas_tbl_update)
+})
+  
+coeff_sort = function(tbl) {
+  coeff_sum = colSums(tbl) %>% as.data.frame()
+  colnames(coeff_sum) = c("sum_coeff") 
+  coeff_sum_sort = coeff_sum %>%
+                 arrange(desc(abs(sum_coeff)))
+  return(coeff_sum_sort)
+}
+
+female_agegroup_features = rownames(coeff_sort(sex_agecomp_features[[1]]))[1:20]
+male_agegroup_features = rownames(coeff_sort(sex_agecomp_features[[2]]))[1:20]
+
+female_coeff_dat = sex_agecomp_features[[1]] %>% as.data.frame() %>%
+                   dplyr::select(female_agegroup_features)
+
+female_agegroup_coeff = cbind(gene = names(colSums(female_coeff_dat)/20),
+                              coeff = colSums(female_coeff_dat)/20) %>%
+                        as.data.frame() %>% arrange(as.numeric(coeff))
+female_agegroup_coeff$gene = factor(female_agegroup_coeff$gene, levels = female_agegroup_coeff$gene)
+female_agegroup_features_plot = ggplot(data = female_agegroup_coeff,
+                                      aes(x = as.numeric(coeff),
+                                          y = gene)) +
+                                      geom_bar(stat = "identity", fill = "#39568CFF") +
+                                      labs(x = "",
+                                           y = "Top gene features")
+
+
+male_coeff_dat = sex_agecomp_features[[2]] %>% as.data.frame() %>%
+                   dplyr::select(male_agegroup_features)
+male_agegroup_coeff = cbind(gene = names(colSums(male_coeff_dat)/20),
+                              coeff = colSums(male_coeff_dat)/20) %>%
+                        as.data.frame() %>% arrange(as.numeric(coeff))
+male_agegroup_coeff$gene = factor(male_agegroup_coeff$gene, levels = male_agegroup_coeff$gene)
+male_agegroup_features_plot = ggplot(data = male_agegroup_coeff,
+                                      aes(x = as.numeric(coeff),
+                                          y = gene)) +
+                                      geom_bar(stat = "identity", fill = "#39568CFF") +
+                                      labs(x = "average coefficient",
+                                           y = "")
+
+#pdf(file = "Add_file_4bc.pdf", width = 3, height = 6.5)
+ggarrange(female_agegroup_features_plot, 
+                              male_agegroup_features_plot, 
+                              ncol = 1, nrow = 2, align = "hv")
+```
+
+## 8. pathways driving sex differences (Figure 4)
+```{r}
+gene_set_lst = list(unique_lst[[1]], #muscle unique fvsm
+                    unique_lst[[2]], #liver unique fvsm
+                    unique_lst[[3]], #wat unique fvsm
+                    agecomp_spe[[2]], #muscle m
+                    agecomp_spe[[3]], #liver f
+                    agecomp_spe[[4]], #liver m
+                    agecomp_spe[[5]]) #wat f
+dbs = c("KEGG_2019_Mouse")
+gene_set_enrich = lapply(c(1:7), function(x) {
+  enriched = enrichR::enrichr(gene_set_lst[[x]], dbs)
+  table = enriched$KEGG_2019_Mouse %>%
+             as.data.frame() %>%
+             filter(Adjusted.P.value < 0.05) 
+  table = table %>%
+          mutate(count = sapply(1:length(table$Overlap), 
+                                    function(x) {
+                             as.numeric(strsplit(table$Overlap, "/")[[x]][1])
+                             })) %>% 
+          mutate(gene_all = sapply(1:length(table$Overlap), 
+                                    function(x) {
+                             as.numeric(strsplit(table$Overlap, "/")[[x]][2])
+                             })) %>%
+          mutate(ratio = count/gene_all*100) %>%
+          mutate(cate = rep(paste0("gene_list", x), nrow(.)))
+  return(table)
+})
+
+enrich_pathway_tbl = Reduce(rbind, gene_set_enrich) # all pathways
+unique_term = unique(enrich_pathway_tbl$Term) #unique pathways
+pathway_lst = lapply(1:7, function(x) { ## complete set of pathways for presence/absence test
+  path = gene_set_enrich[[x]]$Term
+  return(path)
+})
+test_within = sapply(unique_term, function(x) { ## presence/absence test
+  res = sapply(pathway_lst, function(y) {
+   return(x %in% y)
+  })
+  return(res)
+})
+## select pathways present in more than one DEG list
+colnames(test_within)[colSums(test_within == "TRUE") >= 2]
+```
+## 9. WGCNA to determine gene module
+
+# 9a. perform WGCNA and dendrogram (Figure 5A)
+```{r}
+norm_expr_keep = norm_expr[rownames(norm_expr) %in% excl_gene_lst, ] %>%
+                as.data.frame() 
+dat_expr = norm_expr_keep %>%
+           t() %>%
+           as.data.frame() # 15932 genes
+cor <- WGCNA::cor # assign cor function 
+net = blockwiseModules(dat_expr, power = 6, maxBlockSize = 20000,
+  TOMType = "unsigned", minModuleSize = 30,
+  reassignThreshold = 0, mergeCutHeight = 0.3,
+  numericLabels = TRUE, pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "sex_chromosome_excl",
+  verbose = 3)
+cor<-stats::cor
+
+mergedColors = labels2colors(net$colors, colorSeq = c("#21908CFF", "#35B779FF", "#8FD744FF",
+                                                      "#443A83FF", "#FDE725FF", "#31688EFF", "#B8DE29FF"))
+#pdf(file = "Figure5A.pdf", width = 6, height = 4)
+plotDendroAndColors(dendro = net$dendrograms[[1]], #440154FF
+                    colors = mergedColors,
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+```
+
+# 9b. association of 7 modules with age group (Figure 5B)
+```{r}
+mergedColors = net$colors
+datME = moduleEigengenes(dat_expr, mergedColors)$eigengenes
+datME_sex = datME %>%
+            mutate(sex = meta_dat_ids$Sex,
+                   tissue = meta_dat_ids$Tissue,
+                   group = ifelse(meta_dat_ids$Group == "old", 1, 0)) 
+
+no_adj_regress = lapply(1:7, function(x) glm(as.factor(group) ~ datME_sex[, x] + as.factor(tissue), 
+                                      data = datME_sex, family = "binomial"))
+sex_adj_regress = lapply(1:7, function(x) glm(as.factor(group) ~ datME_sex[, x] + as.factor(tissue) + as.factor(sex), 
+                                      data = datME_sex, family = "binomial"))
+
+no_adj_res = data.frame(t(sapply(no_adj_regress, function(x) 
+                       c(or = summary(x)$coefficients[2, 1],
+                         ci.lb = suppressMessages(confint(x)[2, 1]), 
+                         ci.ub = suppressMessages(confint(x)[2, 2]), 
+                         p = summary(x)$coefficients[2, 4])))) %>%
+             cbind(color = colnames(datME)[-8], .) %>%
+             mutate(adjp = p.adjust(p, method = "BH"),
+                       adjust = rep("w/o sex adjustment", nrow(.)))
+
+sex_adj_res = data.frame(t(sapply(sex_adj_regress, function(x) 
+                       c(or = summary(x)$coefficients[2, 1],
+                         ci.lb = suppressMessages(confint(x)[2, 1]), 
+                         ci.ub = suppressMessages(confint(x)[2, 2]), 
+                         p = summary(x)$coefficients[2, 4])))) %>%
+             cbind(color = colnames(datME)[-8], .) %>%
+             mutate(adjp = p.adjust(p, method = "BH"),
+                       adjust = rep("w/ sex adjustment", nrow(.)))
+
+plot_dat_res = rbind(no_adj_res, sex_adj_res) %>%
+               mutate(sig_level = case_when(
+                  adjp < 0.001 ~ "***",
+                  adjp < 0.01 ~ "**",
+                  adjp < 0.05 ~ "*",
+                  adjp < 0.1 ~ "°",
+                  TRUE ~ ""
+               ))
+
+plot_dat_res$adjust = factor(plot_dat_res$adjust, level = c("w/o sex adjustment", "w/ sex adjustment"))
+plot_dat_res$color= factor(plot_dat_res$color, level = colnames(datME))
+#pdf(file = "Figure5B.pdf", width = 6, height = 3)
+ggplot(data = plot_dat_res) +
+       geom_hline(aes(yintercept = color), color = "grey95", size = 7) +
+       ggstance::geom_pointrangeh(
+         aes(x = or,
+             y = color,
+             xmin = ci.lb,
+             xmax = ci.ub,
+             col = adjust),
+             size = 0.35, position = position_dodge(width = 0.8)) +
+      scale_color_manual(name = "Adjustment",
+                         values = c("#39568CFF", "#DCE319FF")) +
+      geom_vline(xintercept = 0, lty = 3) +
+      labs(x = "Coefficient (95% CI)",
+           y = "") +
+      geom_text(aes(y = color,
+                    x = Inf,
+                    label = sig_level,
+                    color = adjust),
+                position = position_dodge(width = 0.7),
+                hjust = 1.5, vjust = 0.9, size = 5,
+                show.legend = FALSE)
+```
+
+# 9c.network plot for ME4 (Add_file)
+```{r}
+#pdf(file = "Add_file6.pdf", width = 10, height = 8)
+set.seed(2023)
+graph = wgcna2igraph(net, dat_expr, top.n.edges = NA,
+                     modules2plot = "4", colors2plot = "#20A387FF",
+                     kME.threshold = 0.5, adjacency.threshold = 0.1,
+                     adj.power = pow, verbose = T,
+                     node.size = 2, frame.color = NA, node.color = "#31688EFF",
+                     edge.alpha = .5, edge.width = 1)
+plot(graph)
+```
+
+# 9d. hub gene selection (Figure 5c)
+```{r}
+mergedColors = net$colors
+geneset = cbind(color = mergedColors,
+            gene = colnames(dat_expr)) %>%
+          as.data.frame()
+
+cluster4_gene = geneset[geneset$color == "4", ]$gene
+age_group = datME_sex$group
+
+geneModuleMembership = as.data.frame(cor(dat_expr, datME, use = "p"))
+cluster4_MM = geneModuleMembership[rownames(geneModuleMembership) %in% cluster4_gene, ] %>%
+              mutate(gene = rownames(.)) %>%
+              dplyr::select(gene, ME4)
+geneTraitSignificance = as.data.frame(cor(dat_expr, age_group, use = "p")) 
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nrow(dat_expr)))
+GS_table = geneTraitSignificance %>%
+           mutate(gene = rownames(.))
+cluster4_GS = GS_table[GS_table$gene %in% cluster4_gene, ]
+cluster4_plot = merge(cluster4_MM, cluster4_GS, by = "gene")
+hub_genes = cluster4_plot %>% 
+            filter(abs(ME4) > 0.8 & abs(V1) > 0.2)
+#pdf(file = "Figure5C.pdf", width = 4, height = 3)
+ggplot(data = cluster4_plot,
+       aes(x = abs(ME4),
+           y = abs(V1))) +
+     geom_point(size = 1, color = "#39568CFF") +
+     geom_point(data = hub_genes,
+                aes(x = abs(ME4),
+                    y = abs(V1)),
+                size = 1.5, color = "#DCE319FF") +
+     xlim(0.2, 1) + ylim(0, 0.6) +
+     geom_vline(xintercept = 0.8, lty = 3) +
+     geom_hline(yintercept = 0.2, lty = 3) +
+     labs(x = "Module Membership (absolute value)",
+          y = "Gene significance (absolute value)")
+```
+
+# 9d. hub gene enrichment (Figure 5d)
+```{r}
+module_geneset = enrich_analysis(hub_genes$gene)[[2]]
+module_geneset$Term = factor(module_geneset$Term, levels = module_geneset$Term)
+#pdf(file = "Figure5D.pdf", width = 8, height = 4)
+ggplot(data = module_geneset,
+         aes(x = count,
+             y = Term)) +
+         geom_point(aes(color = -log10(Adjusted.P.value),
+                    size = ratio)) + 
+         scale_color_viridis(direction = -1) +
+         labs(x = "Gene count",
+              y = "KEGG pathways",
+              color = "-log10(adjusted p-value)",
+              size = "Gene ratio") 
+```
+
+# 9e. hub genes overlapping with other DEG sets (Additional file 7)
+```{r}
+treat_res_list = list(gas_old_fvsm, liver_old_fvsm, wat_old_fvsm,
+               gas_f_agecomp, gas_m_agecomp, 
+               liver_f_agecomp, liver_m_agecomp,
+               wat_f_agecomp, wat_m_agecomp)
+inter_lst = lapply(1:9, function(x) {
+  de_genes = treat_res_list[[x]] %>% filter(adj.P.Val < 0.05)
+  inter = intersect(de_genes$gene, hub_genes$gene)
+  return(inter)
+})
+overlap_genes = unique(Reduce(c, inter_lst))
+```
